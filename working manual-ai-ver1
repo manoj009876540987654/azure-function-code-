@@ -1,0 +1,268 @@
+import logging
+import os
+import json
+import base64
+import requests
+import azure.functions as func
+from azure.identity import DefaultAzureCredential
+from azure.ai.projects import AIProjectClient
+
+app = func.FunctionApp()
+
+# ========= STATIC INFRA =========
+SUBSCRIPTION_ID = "7a735755-6139-4d2c-8ba4-5fccaaae24a0"
+RESOURCE_GROUP = "AI-Ops-Project"
+VM_NAME = "App-Server-01"
+
+# ========= HELPERS =========
+
+def send_teams(card: dict):
+    url = os.getenv("TEAMS_WEBHOOK_URL")
+    if not url:
+        logging.error("Missing TEAMS_WEBHOOK_URL")
+        return
+    r = requests.post(url, json=card, timeout=10)
+    logging.info(f"Teams response: {r.status_code} {r.text}")
+
+
+def safe_parse_json(text: str):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1:
+        try:
+            return json.loads(text[start:end+1])
+        except Exception:
+            pass
+    return None
+
+
+def format_ai_remediation(alertname, instance, severity, steps):
+    lines = []
+    lines.append(
+        f"Here are the remediation steps to address the alert **\"{alertname}\"** on instance **\"{instance}\"** with severity **\"{severity}\"**:\n"
+    )
+    for s in steps:
+        step = s.get("step", "?")
+        action = s.get("action", "Step")
+        cmd = s.get("command", "")
+        notes = s.get("notes", "")
+        lines.append(f"### {step}. {action}")
+        if cmd:
+            lines.append("```bash")
+            lines.append(cmd)
+            lines.append("```")
+        if notes:
+            lines.append(notes)
+        lines.append("")
+    return "\n".join(lines)
+
+# ========= ALERT INGEST =========
+
+@app.function_name(name="alert_ingest")
+@app.route(route="alert_ingest", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def alert_ingest(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        data = req.get_json()
+    except Exception:
+        return func.HttpResponse("Invalid JSON", status_code=400)
+
+    labels = data.get("alert", {}).get("labels", {})
+    alertname = labels.get("alertname")
+    instance = labels.get("instance", "unknown")
+    severity = labels.get("severity", "unknown")
+
+    if not alertname:
+        return func.HttpResponse("Missing alertname", status_code=400)
+
+    github_api = os.getenv("SOP_GITHUB_API")
+    github_token = os.getenv("GITHUB_TOKEN")
+
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    sop = None
+    found = False
+    ai_text = None
+
+    # ---- SOP Lookup ----
+    try:
+        r = requests.get(f"{github_api}/{alertname}.json", headers=headers, timeout=10)
+        if r.status_code == 200:
+            content = r.json().get("content", "")
+            sop = json.loads(base64.b64decode(content).decode("utf-8"))
+            found = True
+    except Exception:
+        logging.exception("GitHub lookup failed")
+
+    # ---- AI fallback using Foundry Agent ----
+    if not found:
+        try:
+            endpoint = os.getenv("AZURE_EXISTING_AIPROJECT_ENDPOINT")
+            agent_name = os.getenv("AZURE_EXISTING_AGENT_ID")
+
+            credential = DefaultAzureCredential()
+            project_client = AIProjectClient(endpoint=endpoint, credential=credential)
+            client = project_client.get_openai_client()
+
+            resp = client.responses.create(
+                input=[{
+                    "role": "user",
+                    "content": f"""
+Generate remediation steps in JSON for this alert:
+
+{json.dumps(labels, indent=2)}
+
+Format:
+{{
+  "remediation_steps": [
+    {{
+      "step": 1,
+      "action": "...",
+      "command": "...",
+      "notes": "..."
+    }}
+  ]
+}}
+"""
+                }],
+                extra_body={"agent": {"name": agent_name, "type": "agent_reference"}}
+            )
+
+            raw = resp.output_text or ""
+            ai_sop = safe_parse_json(raw)
+            steps = (ai_sop or {}).get("remediation_steps", [])
+            ai_text = format_ai_remediation(alertname, instance, severity, steps)
+
+        except Exception:
+            logging.exception("AI fallback failed")
+
+    plan = sop.get("plan", []) if sop else []
+
+    sections = [
+        {
+            "facts": [
+                {"name": "Instance", "value": instance},
+                {"name": "Severity", "value": severity},
+                {"name": "SOP Found", "value": "Yes" if found else "No"}
+            ],
+            "text": sop.get("description", "No description") if sop else "No SOP available"
+        }
+    ]
+
+    if found:
+        sections.append({
+            "title": "Plan",
+            "text": "\n".join([f"- `{p.get('cmd')}`" for p in plan]) if plan else "No plan"
+        })
+
+    if ai_text:
+        sections.append({
+            "title": "🤖 AI Suggested Remediation",
+            "text": ai_text
+        })
+
+    card = {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": f"Alert {alertname}",
+        "themeColor": "FF0000" if severity == "critical" else "0076D7",
+        "title": f"🚨 Alert: {alertname}",
+        "sections": sections,
+        "potentialAction": (
+            [
+                {
+                    "@type": "OpenUri",
+                    "name": "✅ Run Fix",
+                    "targets": [{"os": "default", "uri": f"{os.getenv('FUNCTION_BASE_URL')}/api/teams_action?action=run_fix&alertname={alertname}"}]
+                },
+                {
+                    "@type": "OpenUri",
+                    "name": "❌ Reject",
+                    "targets": [{"os": "default", "uri": f"{os.getenv('FUNCTION_BASE_URL')}/api/teams_action?action=reject&alertname={alertname}"}]
+                }
+            ] if found else
+            [
+                {
+                    "@type": "OpenUri",
+                    "name": "❌ Reject",
+                    "targets": [{"os": "default", "uri": f"{os.getenv('FUNCTION_BASE_URL')}/api/teams_action?action=reject&alertname={alertname}"}]
+                }
+            ]
+        )
+    }
+
+    send_teams(card)
+    return func.HttpResponse(json.dumps({"sent": True, "found": found}), mimetype="application/json")
+
+# ========= TEAMS BUTTON HANDLER =========
+
+@app.function_name(name="teams_action")
+@app.route(route="teams_action", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def teams_action(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        action = req.params.get("action")
+        alertname = req.params.get("alertname")
+
+        if not action or not alertname:
+            return func.HttpResponse("Missing parameters", status_code=400)
+
+        if action == "reject":
+            return func.HttpResponse("<h3>❌ Fix rejected</h3>", mimetype="text/html")
+
+        if action == "run_fix":
+            github_api = os.getenv("SOP_GITHUB_API")
+            github_token = os.getenv("GITHUB_TOKEN")
+
+            headers = {
+                "Authorization": f"token {github_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+
+            r = requests.get(f"{github_api}/{alertname}.json", headers=headers, timeout=10)
+            if r.status_code != 200:
+                return func.HttpResponse("<h3>❌ SOP not found</h3>", mimetype="text/html")
+
+            sop = json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+            plan = sop.get("plan", [])
+
+            if not plan or "cmd" not in plan[0]:
+                return func.HttpResponse("<h3>❌ No command in SOP</h3>", mimetype="text/html")
+
+            cmd = plan[0]["cmd"]
+
+            credential = DefaultAzureCredential()
+            token = credential.get_token("https://management.azure.com/.default").token
+
+            az_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            url = (
+                f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}"
+                f"/resourceGroups/{RESOURCE_GROUP}"
+                f"/providers/Microsoft.Compute/virtualMachines/{VM_NAME}"
+                f"/runCommand?api-version=2023-03-01"
+            )
+
+            payload = {"commandId": "RunShellScript", "script": [cmd]}
+            resp = requests.post(url, headers=az_headers, json=payload, timeout=30)
+
+            if resp.status_code not in (200, 202):
+                return func.HttpResponse("<h3>❌ Fix failed</h3>", mimetype="text/html")
+
+            return func.HttpResponse("<h3>✅ Fix executed successfully</h3>", mimetype="text/html")
+
+        return func.HttpResponse("Unknown action", status_code=400)
+
+    except Exception as e:
+        logging.exception("teams_action failed")
+        return func.HttpResponse(f"<h3>❌ Error</h3><pre>{str(e)}</pre>", mimetype="text/html", status_code=500)
